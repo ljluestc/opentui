@@ -230,6 +230,10 @@ interface ResolvedTableRenderableOptions {
 const TRAILING_MARKDOWN_BLOCK_BREAKS_RE = /(?:\r?\n){2,}$/
 const TRAILING_MARKDOWN_BLOCK_NEWLINES_RE = /(?:\r?\n)+$/
 const markdownLinkEncoder = new TextEncoder()
+// Each nested list adds several renderables to the tree, and both the create and update paths recurse per level.
+// Model output such as "- - - - ..." can nest thousands deep and overflow the stack, so deeper lists render as
+// plain text. That text skips markdown highlighting because tree-sitter also fails on deeply nested lists.
+const MAX_LIST_NESTING_DEPTH = 16
 
 function isSupportedLinkTarget(url: string): boolean {
   if (url.length > MAX_LINK_URL_BYTES) return false
@@ -265,6 +269,7 @@ interface ListItemRenderInput {
   marker: string
   markerWidth: number
   id: string
+  depth: number
 }
 
 export class MarkdownRenderable extends Renderable {
@@ -854,7 +859,12 @@ export class MarkdownRenderable extends Renderable {
     return renderable
   }
 
-  private createListRenderable(token: Tokens.List, id: string, marginBottom: number = 0): BoxRenderable {
+  private createListRenderable(
+    token: Tokens.List,
+    id: string,
+    marginBottom: number = 0,
+    depth: number = 0,
+  ): BoxRenderable {
     const list = new BoxRenderable(this.ctx, {
       id,
       width: "100%",
@@ -864,14 +874,14 @@ export class MarkdownRenderable extends Renderable {
     })
     this._ownedStructuredRenderables.add(list)
 
-    for (const item of this.getListItemInputs(token, id)) {
+    for (const item of this.getListItemInputs(token, id, depth)) {
       list.add(this.createListItemRenderable(item))
     }
 
     return list
   }
 
-  private getListItemInputs(token: Tokens.List, id: string): ListItemRenderInput[] {
+  private getListItemInputs(token: Tokens.List, id: string, depth: number): ListItemRenderInput[] {
     const items = token.items ?? []
     const start = token.start === "" || token.start === undefined || token.start === null ? 1 : Number(token.start)
     const markerWidth = Math.max(1, ...items.map((_, index) => (token.ordered ? `${start + index}.` : "-").length))
@@ -881,6 +891,7 @@ export class MarkdownRenderable extends Renderable {
       marker: token.ordered ? `${start + index}.` : "-",
       markerWidth,
       id: `${id}-item-${index}`,
+      depth,
     }))
   }
 
@@ -890,12 +901,13 @@ export class MarkdownRenderable extends Renderable {
     previousToken: Tokens.List | undefined,
     id: string,
     marginBottom: number = 0,
+    depth: number = 0,
   ): boolean {
     if (!(renderable instanceof BoxRenderable)) return false
 
     renderable.marginBottom = marginBottom
 
-    const inputs = this.getListItemInputs(token, id)
+    const inputs = this.getListItemInputs(token, id, depth)
     const previousItems = previousToken?.items ?? []
     const rows = renderable.getChildren()
 
@@ -952,7 +964,7 @@ export class MarkdownRenderable extends Renderable {
         pendingMarginTop = Math.max(pendingMarginTop, 1)
         continue
       }
-      const renderable = this.createListChildRenderable(child, `${input.id}-child-${index}`)
+      const renderable = this.createListChildRenderable(child, `${input.id}-child-${index}`, input.depth + 1)
       if (!renderable) continue
       renderable.marginTop = child.type === "list" ? 0 : pendingMarginTop
       pendingMarginTop = 0
@@ -976,7 +988,7 @@ export class MarkdownRenderable extends Renderable {
       return true
     }
 
-    return this.applyListItemChildren(content, input.item, previousItem, input.id)
+    return this.applyListItemChildren(content, input.item, previousItem, input.id, input.depth + 1)
   }
 
   private applyListItemChildren(
@@ -984,6 +996,7 @@ export class MarkdownRenderable extends Renderable {
     item: Tokens.ListItem,
     previousItem: Tokens.ListItem | undefined,
     id: string,
+    depth: number,
   ): boolean {
     const previousTokens = previousItem ? this.getRenderableListItemTokens(previousItem) : []
     const children = content.getChildren()
@@ -1006,7 +1019,7 @@ export class MarkdownRenderable extends Renderable {
       pendingMarginTop = 0
 
       if (!existing) {
-        const renderable = this.createListChildRenderable(token, childId)
+        const renderable = this.createListChildRenderable(token, childId, depth)
         if (!renderable) return false
         renderable.marginTop = marginTop
         content.add(renderable, childIndex)
@@ -1014,7 +1027,7 @@ export class MarkdownRenderable extends Renderable {
         continue
       }
 
-      if (!this.applyListChildRenderable(existing, token, previousTokens[childIndex], childId)) {
+      if (!this.applyListChildRenderable(existing, token, previousTokens[childIndex], childId, depth)) {
         return false
       }
       existing.marginTop = marginTop
@@ -1041,6 +1054,7 @@ export class MarkdownRenderable extends Renderable {
     token: MarkedToken,
     previousToken: MarkedToken | undefined,
     id: string,
+    depth: number,
   ): boolean {
     if ((token.type === "text" || token.type === "paragraph") && renderable instanceof CodeRenderable) {
       this.applyMarkdownCodeRenderable(renderable, this.normalizeScrollbackMarkdownBlockRaw(token.raw), 0)
@@ -1048,7 +1062,20 @@ export class MarkdownRenderable extends Renderable {
     }
 
     if (token.type === "list" && renderable instanceof BoxRenderable) {
-      return this.applyListRenderable(renderable, token as Tokens.List, previousToken as Tokens.List | undefined, id)
+      return this.applyListRenderable(
+        renderable,
+        token as Tokens.List,
+        previousToken as Tokens.List | undefined,
+        id,
+        0,
+        depth,
+      )
+    }
+
+    // Only lists past MAX_LIST_NESTING_DEPTH are created as plain text.
+    if (token.type === "list" && renderable instanceof TextRenderable) {
+      renderable.content = this.createFlattenedListContent(token as Tokens.List)
+      return true
     }
 
     if (token.type === "code" && renderable instanceof CodeRenderable) {
@@ -1057,6 +1084,10 @@ export class MarkdownRenderable extends Renderable {
     }
 
     return previousToken?.raw === token.raw
+  }
+
+  private createFlattenedListContent(token: Tokens.List): StyledText {
+    return new StyledText([this.createChunk(this.normalizeScrollbackMarkdownBlockRaw(token.raw), "default")])
   }
 
   private destroyListItemChildrenAfter(content: BoxRenderable, index: number): void {
@@ -1080,7 +1111,7 @@ export class MarkdownRenderable extends Renderable {
     }
   }
 
-  private createListChildRenderable(token: MarkedToken, id: string): Renderable | null {
+  private createListChildRenderable(token: MarkedToken, id: string, depth: number): Renderable | null {
     if (token.type === "text" || token.type === "paragraph") {
       return this.createMarkdownCodeRenderable(
         this.normalizeScrollbackMarkdownBlockRaw(token.raw),
@@ -1091,7 +1122,10 @@ export class MarkdownRenderable extends Renderable {
         this.createInitialStyledText(token),
       )
     }
-    if (token.type === "list") return this.createListRenderable(token as Tokens.List, id)
+    if (token.type === "list" && depth >= MAX_LIST_NESTING_DEPTH) {
+      return new TextRenderable(this.ctx, { id, content: this.createFlattenedListContent(token as Tokens.List) })
+    }
+    if (token.type === "list") return this.createListRenderable(token as Tokens.List, id, 0, depth)
     if (token.type === "code") return this.createCodeRenderable(token as Tokens.Code, id)
     if (token.type === "blockquote") return this.createBlockquoteRenderable(token, id)
     if (token.type === "hr") return this.createHorizontalRuleRenderable(id)

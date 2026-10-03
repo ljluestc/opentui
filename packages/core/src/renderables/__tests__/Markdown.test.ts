@@ -1486,6 +1486,36 @@ test("top-level structured lists align nested fenced code under nested content",
   `)
 })
 
+test("top-level structured lists cap pathological nesting depth", async () => {
+  const content = "- ".repeat(2000) + "leaf"
+  const md = createMarkdownRenderable({
+    id: "markdown-structured-list-deep",
+    content: content.slice(0, content.length / 2),
+    syntaxStyle,
+    streaming: true,
+    internalBlockMode: "top-level",
+  })
+
+  renderer.root.add(md)
+  await renderOnce()
+  md.content = content
+  await renderOnce()
+
+  const boxDepth = (renderable: BoxRenderable): number =>
+    1 +
+    Math.max(
+      0,
+      ...renderable
+        .getChildren()
+        .filter((child) => child instanceof BoxRenderable)
+        .map((child) => boxDepth(child as BoxRenderable)),
+    )
+  const list = md._blockStates[0]?.renderable
+  expect(list).toBeInstanceOf(BoxRenderable)
+  expect(boxDepth(list as BoxRenderable)).toBeLessThan(200)
+  expect(captureFrame()).toContain("- - - -")
+})
+
 test("top-level structured ordered lists align multi-digit markers", async () => {
   const md = createMarkdownRenderable({
     id: "markdown-structured-list-numbering",
